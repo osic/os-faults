@@ -123,7 +123,7 @@ class CinderVolumeService(service.ServiceAsProcess):
 
 
 class OSAManagement(cloud_management.CloudManagement):
-    NAME = 'OSA'
+    NAME = 'osa'
     DESCRIPTION = 'OSA management driver'
     NODE_CLS = OSANodeCollection
     SERVICE_NAME_TO_CLASS = {
