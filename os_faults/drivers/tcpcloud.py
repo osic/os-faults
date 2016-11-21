@@ -28,10 +28,21 @@ LOG = logging.getLogger(__name__)
 class TCPCloudNodeCollection(node_collection.NodeCollection):
 
     def connect(self, network_name):
-        raise NotImplementedError
+        LOG.info("Connect network '%s' on nodes: %s", network_name, self)
+        task = {'osa_network_mgmt': {
+            'network_name': network_name,
+            'operation': 'up',
+        }}
+        self.cloud_management.execute_on_cloud(self.get_ips(), task)
 
     def disconnect(self, network_name):
-        raise NotImplementedError
+        LOG.info("Disconnect network '%s' on nodes: %s",
+                 network_name, self)
+        task = {'osa_network_mgmt': {
+            'network_name': network_name,
+            'operation': 'down',
+        }}
+        self.cloud_management.execute_on_cloud(self.get_ips(), task)
 
 
 SALT_CALL = 'salt-call --local --retcode-passthrough '
@@ -39,34 +50,47 @@ SALT_RESTART = SALT_CALL + 'service.restart {service}'
 SALT_TERMINATE = SALT_CALL + 'service.stop {service}'
 SALT_START = SALT_CALL + 'service.start {service}'
 
+BASH = 'bash -c "{}"'
+FIND_Q = 'ps ax | grep -q {}'
+FIND_E = 'ps ax | grep -e {}'
+EXCLUDE = 'ps ax | grep -qv {}'
+
 
 class SaltService(service.ServiceAsProcess):
 
-    @utils.require_variables('SALT_SERVICE')
+    @utils.require_variables('SALT_SERVICE', 'SALT_FIND')
     def __init__(self, *args, **kwargs):
         super(SaltService, self).__init__(*args, **kwargs)
 
         self.RESTART_CMD = SALT_RESTART.format(service=self.SALT_SERVICE)
         self.TERMINATE_CMD = SALT_TERMINATE.format(service=self.SALT_SERVICE)
         self.START_CMD = SALT_START.format(service=self.SALT_SERVICE)
+        self.FIND_CMD = self.SALT_FIND
 
 
 class KeystoneService(SaltService):
-    SERVICE_NAME = 'keystone'
-    GREP = '[k]eystone-all'
-    SALT_SERVICE = 'keystone'
+    SERVICE_NAME = 'apache2'
+    GREP = ['[k]eystone','[a]pache2']
+    SALT_SERVICE = 'apache2'
+    SALT_FIND = BASH.format(' && '.join([FIND_Q.format(g) for g in GREP[:-1]]) +
+                            ' && ' + FIND_E.format(GREP[-1]))
 
 
 class HorizonService(SaltService):
     SERVICE_NAME = 'horizon'
     GREP = '[a]pache2'
+    IGNORE = '[k]eystone'
     SALT_SERVICE = 'apache2'
+    SALT_FIND = BASH.format(FIND_Q.format(GREP) + ' && ' +
+                            FIND_E.format(IGNORE) + ' | ' +
+                            EXCLUDE.format(IGNORE))
 
 
 class MemcachedService(SaltService):
     SERVICE_NAME = 'memcached'
     GREP = '[m]emcached'
     SALT_SERVICE = 'memcached'
+    SALT_FIND = BASH.format(FIND_E.format(GREP))
 
 
 class MySQLService(SaltService):
@@ -78,8 +102,9 @@ class MySQLService(SaltService):
 
 class RabbitMQService(SaltService):
     SERVICE_NAME = 'rabbitmq'
-    GREP = 'beam\.smp .*rabbitmq_server'
+    GREP = '[r]abbitmq-server'
     SALT_SERVICE = 'rabbitmq-server'
+    SALT_FIND = BASH.format(FIND_E.format(GREP))
 
 
 class NovaAPIService(SaltService):
@@ -98,12 +123,13 @@ class NovaComputeService(SaltService):
     SERVICE_NAME = 'nova-compute'
     GREP = '[n]ova-compute'
     SALT_SERVICE = 'nova-compute'
-
+    SALT_FIND = BASH.format('initctl list | grep -e {}'.format(GREP))
 
 class NovaSchedulerService(SaltService):
     SERVICE_NAME = 'nova-scheduler'
     GREP = '[n]ova-scheduler'
     SALT_SERVICE = 'nova-scheduler'
+    SALT_FIND = BASH.format(FIND_E.format(GREP))
 
 
 class HeatAPIService(SaltService):
@@ -203,14 +229,36 @@ class TCPCloudManagement(cloud_management.CloudManagement):
 
     def _get_cloud_hosts(self):
         if not self.cached_cloud_hosts:
-            cmd = "salt -E '(ctl*|cmp*)' network.interfaces --out=yaml"
+            cmd = "salt -E '(infra*|compute*)' network.interfaces --out=yaml"
             result = self.execute_on_master_node({'command': cmd})
             stdout = result[0].payload['stdout']
             for fqdn, net_data in yaml.load(stdout).items():
-                host = node_collection.Host(
-                    ip=net_data['eth0']['inet'][0]['address'],
-                    mac=net_data['eth0']['hwaddr'],
-                    fqdn=fqdn)
+                try:
+                    host = node_collection.Host(
+                        ip=net_data['eth1']['inet'][0]['address'],
+                        mac=net_data['eth1']['hwaddr'],
+                        fqdn=fqdn)
+                except KeyError:
+                    regex_ipaddr = '([0-9]{1,3}\.){3}[0-9]{1,3}'
+                    regex_mac = '([0-9a-z]{2}\:){5}[0-9a-z]{2}'
+                    ip_cmd = BASH.format(
+                        'grep -w {} /etc/hosts | grep -oE \'{}\''.format(
+                            fqdn.split('.')[0], regex_ipaddr
+                        )
+                    )
+                    ip_res = self.execute_on_master_node({'command': ip_cmd})
+                    ip_out = ip_res[0].payload['stdout']
+                    mac_cmd = BASH.format(
+                        'arp -an {} | grep -oE \'{}\''.format(
+                            ip_out, regex_mac
+                        )
+                    )
+                    mac_res = self.execute_on_master_node({'command': mac_cmd})
+                    mac_out = mac_res[0].payload['stdout']
+                    host = node_collection.Host(
+                        ip=ip_out,
+                        mac=mac_out,
+                        fqdn=fqdn)
                 self.cached_cloud_hosts.append(host)
                 self.fqdn_to_hosts[host.fqdn] = host
             self.cached_cloud_hosts = sorted(self.cached_cloud_hosts)
